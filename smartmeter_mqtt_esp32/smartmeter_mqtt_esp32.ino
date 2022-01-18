@@ -1,9 +1,12 @@
 // SmartMeter->MQTT on ESP32
 // Pascal Stang
 //
-// Converts the debug serial stream from the Emporia VUE HAN (Home Area Network) bridge
-// to MQTT reports published via wifi.
-// Expects the debug serial to be on Serial2 (GPIO16/GPIO17)
+// This ESP32 arduino application parses the debug serial stream from the
+// Emporia VUE HAN (Home Area Network) Smart Home Energy Monitor
+// and converts it to MQTT reports published via WiFi.
+// The application expects the Emporia debug serial to be on Serial2 (GPIO16/GPIO17).
+//
+// This application will run on most ESP32 hardware.
 //
 // Requires:
 // - ESP32 development environment
@@ -13,16 +16,25 @@
 #include <PubSubClient.h>
 #include <Wire.h>
 
-// Replace the next variables with your SSID/Password combination
-const char* WifiHostname = "smartmeter";
-const char* WifiSsid = "MySSID";
-const char* WifiPassword = "MyPassword";
+// Wifi Network parameters
+// Overwrite these defaults with your hostname/SSID/Password.
+const char* WifiHostname = "smartmeter-esp32";
+const char* WifiSsid = "airdropN";
+const char* WifiPassword = "encryptionkey";
+unsigned long WiFiConnInterval = 10000; // 10 seconds
 
-// MQTT Broker IP address:
+// MQTT Parameters
+// Broker host/IP address:
 const char* MqttServer = "192.168.1.28";
+const char* MqttTopicUptime = "smbridge/uptime";
+const char* MqttTopicCommand = "smbridge/cmd";
+const char* MqttTopicSmartmeterReport = "smartmeter/report";
 
-// LED Pin
-const int LedPin = 2;
+unsigned long MqttUptimeInterval = 10000; // 10 seconds
+
+// LED Pins (if only one LED available, use same pin).
+const int LedStatPin = 2;
+const int LedActPin = 2;
 
 // Smartmeter data structure
 typedef struct smartmeterData_s {
@@ -38,7 +50,6 @@ typedef struct smartmeterData_s {
 // Global objects
 WiFiClient EspClient;
 PubSubClient MqttClient(EspClient);
-long TimeLastMsg = 0;
 double Uptime = 0;
 smartmeterData_t smartmeterData;
 
@@ -48,7 +59,7 @@ void setup() {
   Serial.println("SmartMeter-MQTT server");
 
   Serial.println("Setting up WiFi");
-  setupWifi();
+  wifiSetup();
 
   Serial.println("Setting up MQTT");
   MqttClient.setServer(MqttServer, 1883);
@@ -57,24 +68,36 @@ void setup() {
   Serial.println("Setting up SmartMeter");
   smartmeterSetup();
 
-  pinMode(LedPin, OUTPUT);
+  pinMode(LedStatPin, OUTPUT);
+  pinMode(LedActPin, OUTPUT);
 }
 
 void loop() {
-  // Handle reconnection.
-  if (!MqttClient.connected()) {
-    mqttReconnect();
-  }
+  // Wifi handle reconnection.
+  wifiReconnect();
+  
+  // MQTT handle (re)connection.
+  mqttReconnect();
+
   // Handle MQTT servicing.
   MqttClient.loop();
 
   // Handle smartmeter servicing.
   smartmeterService();
 
+  // Indicate status on LED.
+  int connStat = 0;
+  if((WiFi.status() == WL_CONNECTED) && MqttClient.connected()) {
+    connStat = 1;
+  } else {
+    connStat = 0;
+  }
+  digitalWrite(LedStatPin, !connStat);
+
   // Every 10 seconds, report our internal uptime.
-  long now = millis();
-  if ((now - TimeLastMsg) > 10000) {
-    TimeLastMsg += 10000;
+  static unsigned long TimerUptimeMsg;
+  if(millis() >= TimerUptimeMsg) {
+    TimerUptimeMsg += MqttUptimeInterval;
 
     // Report internal uptime.
     char temp_str[40];
@@ -82,7 +105,7 @@ void loop() {
     dtostrf(Uptime, 1, 3, temp_str);
     Serial.print("Uptime: ");
     Serial.println(temp_str);
-    MqttClient.publish("smbridge/uptime", temp_str);
+    MqttClient.publish(MqttTopicUptime, temp_str);
   }
 
   // Sleep in microseconds.
@@ -93,25 +116,38 @@ void loop() {
 }
 
 //-----------------------------------------------
-void setupWifi() {
+void wifiSetup() {
   delay(10);
-  // We start by connecting to a WiFi network
+  // Connecting to the WiFi network.
   Serial.println();
   Serial.print("Wifi: Connecting to ");
   Serial.println(WifiSsid);
 
-  WiFi.setHostname(WifiHostname)
+  WiFi.setHostname(WifiHostname);
   WiFi.begin(WifiSsid, WifiPassword);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long timeout = millis() + WiFiConnInterval;
+  while((WiFi.status() != WL_CONNECTED) && (millis() < timeout)) {
     delay(500);
     Serial.print(".");
   }
 
   Serial.println("");
-  Serial.println("WiFi: Connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi: Connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
+
+void wifiReconnect() {
+  static unsigned long attempt_next = 0;
+  if((WiFi.status() != WL_CONNECTED) && (millis() >= attempt_next)) {
+    Serial.println("Wifi: Reconnecting...");
+    WiFi.disconnect();
+    WiFi.reconnect();
+    attempt_next = millis() + WiFiConnInterval;
+  }
 }
 
 void mqttCallback(char* topic, byte* message, unsigned int length) {
@@ -128,16 +164,16 @@ void mqttCallback(char* topic, byte* message, unsigned int length) {
 
   // Example command handling, this is currently used only for demonstration.
 
-  // If a message is received on the topic smbridge/cmd, then process the command.
-  if(String(topic) == "smbridge/cmd") {
+  // If a message is received on the topic MqttTopicCommand, then process the command.
+  if(String(topic) == MqttTopicCommand) {
     Serial.print("Command: ");
     Serial.println(messageTemp);
 
     // Process command.
     if(messageTemp == "led on") {
-      digitalWrite(LedPin, HIGH);
+      digitalWrite(LedActPin, HIGH);
     } else if(messageTemp == "led off") {
-      digitalWrite(LedPin, LOW);
+      digitalWrite(LedActPin, LOW);
     } else {
       Serial.println("Command: Not recognized");
     }
@@ -145,13 +181,15 @@ void mqttCallback(char* topic, byte* message, unsigned int length) {
 }
 
 void mqttConnectAction() {
-  // Subscribe
-  MqttClient.subscribe("smbridge/cmd");
+  // Subscribe to command topic.
+  MqttClient.subscribe(MqttTopicCommand);
 }
 
 void mqttReconnect() {
-  // Loop until we're reconnected
-  while (!MqttClient.connected()) {
+  // Attempt to connect up to N times.
+  int n = 2;
+  // Loop until we're reconnected.
+  while(!MqttClient.connected() && (n--)) {
     Serial.print("MQTT: Attempting connection...");
     // Attempt to connect
     if(MqttClient.connect("SmartMeter-ESP32")) {
@@ -186,7 +224,7 @@ void smartmeterService() {
   //  Serial.println("");
   //}
 
-  digitalWrite(LedPin, HIGH);
+  digitalWrite(LedActPin, HIGH);
   if(rc == 10) {
     char temp_str[400];
     Serial.print("SmartMeter:");
@@ -240,9 +278,9 @@ void smartmeterService() {
       smartmeterData.LocalSum,
       smartmeterData.SolarSum,
       smartmeterData.UptimeHan);
-    MqttClient.publish("smartmeter/report", temp_str);
+    MqttClient.publish(MqttTopicSmartmeterReport, temp_str);
   }
-  digitalWrite(LedPin, LOW);
+  digitalWrite(LedActPin, LOW);
 }
 
 int smartmeterReportGet(char *buffer, int maxlen) {
@@ -273,7 +311,7 @@ int smartmeterReportGet(char *buffer, int maxlen) {
 int smartmeterProcess(const char *str) {
   int rc = 0;
 
-  // Find strings
+  // Find strings and parse them.
   char *p;
   if(p = strstrAfter(str, "Curr time:")) {
     smartmeterData.Timestamp = strtol(p, 0, 10);
